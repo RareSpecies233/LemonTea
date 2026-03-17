@@ -1,0 +1,17 @@
+.DS_Store
+build/
+logs/
+Temp/
+*.log
+*.tmp
+config/*.json
+!config/*.example.json
+config/*.local.json
+config/*.private.json
+plugins/__pycache__/
+*.pyc
+*.pyo
+*.swp
+*.swo
+*.out
+*.dSYM/

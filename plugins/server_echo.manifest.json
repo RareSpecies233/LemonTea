@@ -1,0 +1,8 @@
+{
+  "name": "server_echo",
+  "description": "server-side subprocess test plugin",
+  "executable": "python3",
+  "script": "server_echo_plugin.py",
+  "port": 9201,
+  "auto_start": true
+}
