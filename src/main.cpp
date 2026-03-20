@@ -1,5 +1,6 @@
 #include <asio.hpp>
 #include <crow.h>
+#include <crow/middlewares/cors.h>
 #include <nlohmann/json.hpp>
 #include <rtc/rtc.hpp>
 
@@ -138,6 +139,10 @@ json parse_body(const crow::request& request) {
 crow::response json_response(const json& payload, int code = 200) {
     crow::response response(code);
     response.set_header("Content-Type", "application/json; charset=utf-8");
+    // Allow browser frontends to call this API during development and from other origins.
+    response.set_header("Access-Control-Allow-Origin", "*");
+    response.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    response.set_header("Access-Control-Allow-Headers", "Content-Type");
     response.body = payload.dump(2);
     return response;
 }
@@ -815,7 +820,10 @@ int main(int argc, char** argv) {
         LemonTeaServer server(config);
         server.start();
 
-        crow::SimpleApp app;
+        // Enable CORS so browser frontends can call the API from other origins.
+        crow::App<crow::CORSHandler> app;
+        auto& cors = app.get_middleware<crow::CORSHandler>();
+        cors.global().origin("*").methods("GET"_method, "POST"_method, "OPTIONS"_method).headers("Content-Type");
 
         CROW_ROUTE(app, "/health")([&server] {
             return json_response({
