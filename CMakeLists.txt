@@ -9,6 +9,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 include(FetchContent)
 
 FetchContent_Declare(
@@ -53,4 +56,5 @@ target_include_directories(lemontea PRIVATE
 )
 
 target_compile_definitions(lemontea PRIVATE ASIO_STANDALONE)
-target_link_libraries(lemontea PRIVATE LibDataChannel::LibDataChannel)
+target_link_libraries(lemontea PRIVATE LibDataChannel::LibDataChannel Threads::Threads)
+target_link_options(lemontea PRIVATE -pthread)
