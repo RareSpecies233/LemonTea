@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -294,12 +295,15 @@ public:
     virtual std::string client_id() const = 0;
 };
 
+using ClientEventCallback = std::function<void(const std::string&, const json&)>;
+
 class TcpClientSession final : public IClientSession, public std::enable_shared_from_this<TcpClientSession> {
 public:
-    TcpClientSession(tcp::socket socket, std::string clientId, std::string readBuffer)
+    TcpClientSession(tcp::socket socket, std::string clientId, std::string readBuffer, ClientEventCallback eventCallback)
         : socket_(std::move(socket)),
           clientId_(std::move(clientId)),
-          readBuffer_(std::move(readBuffer)) {}
+          readBuffer_(std::move(readBuffer)),
+          eventCallback_(std::move(eventCallback)) {}
 
     ~TcpClientSession() override {
         close();
@@ -386,6 +390,9 @@ private:
                     lastSeen_ = message.value("timestamp", now_string());
                     log_line("DEBUG", "heartbeat from " + clientId_);
                 } else {
+                    if (eventCallback_) {
+                        eventCallback_(clientId_, message);
+                    }
                     log_line("INFO", "unsolicited message type=" + type + " from " + clientId_);
                 }
             }
@@ -409,14 +416,16 @@ private:
     std::condition_variable responseCv_;
     std::map<std::string, json> responses_;
     inline static std::atomic<uint64_t> requestCounter_{0};
+    ClientEventCallback eventCallback_;
 };
 
 class WebRtcClientSession final : public IClientSession, public std::enable_shared_from_this<WebRtcClientSession> {
 public:
-    WebRtcClientSession(tcp::socket signalSocket, std::string clientId, std::vector<std::string> stunServers)
+    WebRtcClientSession(tcp::socket signalSocket, std::string clientId, std::vector<std::string> stunServers, ClientEventCallback eventCallback)
         : signalSocket_(std::move(signalSocket)),
           clientId_(std::move(clientId)),
-          stunServers_(std::move(stunServers)) {}
+          stunServers_(std::move(stunServers)),
+          eventCallback_(std::move(eventCallback)) {}
 
     ~WebRtcClientSession() override {
         close();
@@ -573,6 +582,9 @@ private:
                 } else if (type == "hello") {
                     lastSeen_ = now_string();
                 } else {
+                    if (eventCallback_) {
+                        eventCallback_(clientId_, payload);
+                    }
                     log_line("INFO", "unsolicited WebRTC message type=" + type + " from " + clientId_);
                 }
             } catch (const std::exception& ex) {
@@ -651,10 +663,13 @@ private:
     std::mutex openMutex_;
     std::condition_variable openCv_;
     inline static std::atomic<uint64_t> requestCounter_{0};
+    ClientEventCallback eventCallback_;
 };
 
 class LemonTeaServer {
 public:
+    using EventHandler = std::function<void(const std::string&, const json&)>;
+
     explicit LemonTeaServer(Config config)
         : config_(std::move(config)),
           io_(),
@@ -734,6 +749,18 @@ public:
         return transport_mode_name(config_.transport.mode);
     }
 
+    int subscribe_events(EventHandler handler) {
+        std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+        const int subscriptionId = ++eventSubscriptionCounter_;
+        eventHandlers_[subscriptionId] = std::move(handler);
+        return subscriptionId;
+    }
+
+    void unsubscribe_events(int subscriptionId) {
+        std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+        eventHandlers_.erase(subscriptionId);
+    }
+
 private:
     std::shared_ptr<IClientSession> get_client(const std::string& clientId) const {
         std::lock_guard<std::mutex> lock(clientsMutex_);
@@ -754,6 +781,23 @@ private:
         clients_[session->client_id()] = session;
     }
 
+    void dispatch_event(const std::string& clientId, const json& payload) {
+        std::vector<EventHandler> handlers;
+        {
+            std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+            for (const auto& item : eventHandlers_) {
+                handlers.push_back(item.second);
+            }
+        }
+        for (const auto& handler : handlers) {
+            try {
+                handler(clientId, payload);
+            } catch (const std::exception& ex) {
+                log_line("ERROR", std::string("event handler failed: ") + ex.what());
+            }
+        }
+    }
+
     void accept_loop_tcp() {
         while (running_) {
             try {
@@ -765,7 +809,12 @@ private:
                     throw std::runtime_error("first message must be hello");
                 }
                 auto clientId = hello.value("client_id", "unknown-client");
-                auto session = std::make_shared<TcpClientSession>(std::move(socket), clientId, buffer);
+                auto session = std::make_shared<TcpClientSession>(
+                    std::move(socket),
+                    clientId,
+                    buffer,
+                    [this](const std::string& id, const json& payload) { dispatch_event(id, payload); }
+                );
                 register_client(session);
                 session->start();
                 log_line("INFO", "registered TCP client " + clientId);
@@ -788,7 +837,12 @@ private:
                     throw std::runtime_error("first signaling message must be signal_hello");
                 }
                 auto clientId = hello.value("client_id", "unknown-client");
-                auto session = std::make_shared<WebRtcClientSession>(std::move(signalSocket), clientId, config_.transport.stunServers);
+                auto session = std::make_shared<WebRtcClientSession>(
+                    std::move(signalSocket),
+                    clientId,
+                    config_.transport.stunServers,
+                    [this](const std::string& id, const json& payload) { dispatch_event(id, payload); }
+                );
                 session->start();
                 register_client(session);
                 log_line("INFO", "registered WebRTC client " + clientId);
@@ -808,7 +862,226 @@ private:
     PluginManager plugins_;
     mutable std::mutex clientsMutex_;
     std::map<std::string, std::shared_ptr<IClientSession>> clients_;
+    std::mutex eventHandlersMutex_;
+    std::map<int, EventHandler> eventHandlers_;
+    std::atomic<int> eventSubscriptionCounter_{0};
     std::thread acceptThread_;
+};
+
+class TerminalBridge {
+public:
+    explicit TerminalBridge(LemonTeaServer& server)
+        : server_(server) {
+        subscriptionId_ = server_.subscribe_events(
+            [this](const std::string& clientId, const json& payload) {
+                forward_client_event(clientId, payload);
+            }
+        );
+    }
+
+    ~TerminalBridge() {
+        server_.unsubscribe_events(subscriptionId_);
+    }
+
+    void on_open(crow::websocket::connection& conn) {
+        std::lock_guard<std::mutex> lock(sessionsMutex_);
+        browserSessions_[&conn] = BrowserSession{};
+    }
+
+    void on_close(crow::websocket::connection& conn) {
+        BrowserSession session;
+        {
+            std::lock_guard<std::mutex> lock(sessionsMutex_);
+            auto it = browserSessions_.find(&conn);
+            if (it == browserSessions_.end()) {
+                return;
+            }
+            session = it->second;
+            browserSessions_.erase(it);
+        }
+
+        if (!session.clientId.empty() && !session.remoteSessionId.empty()) {
+            try {
+                server_.request_client(session.clientId, {
+                    {"type", "pty_close"},
+                    {"session_id", session.remoteSessionId},
+                });
+            } catch (const std::exception& ex) {
+                log_line("ERROR", std::string("failed to close remote PTY session: ") + ex.what());
+            }
+        }
+    }
+
+    void on_message(crow::websocket::connection& conn, const std::string& data, bool isBinary) {
+        if (isBinary) {
+            send_json(conn, {{"type", "error"}, {"message", "binary websocket messages are not supported"}});
+            return;
+        }
+
+        try {
+            auto payload = json::parse(data);
+            const auto action = payload.value("action", "");
+            if (action == "open") {
+                handle_open(conn, payload);
+            } else if (action == "input") {
+                handle_input(conn, payload);
+            } else if (action == "resize") {
+                handle_resize(conn, payload);
+            } else if (action == "close") {
+                handle_close(conn);
+            } else {
+                send_json(conn, {{"type", "error"}, {"message", "unsupported terminal action"}});
+            }
+        } catch (const std::exception& ex) {
+            send_json(conn, {{"type", "error"}, {"message", ex.what()}});
+        }
+    }
+
+private:
+    struct BrowserSession {
+        std::string clientId;
+        std::string remoteSessionId;
+    };
+
+    BrowserSession require_browser_session(crow::websocket::connection& conn) {
+        std::lock_guard<std::mutex> lock(sessionsMutex_);
+        auto it = browserSessions_.find(&conn);
+        if (it == browserSessions_.end()) {
+            throw std::runtime_error("terminal websocket session not initialized");
+        }
+        return it->second;
+    }
+
+    void handle_open(crow::websocket::connection& conn, const json& payload) {
+        const auto clientId = payload.value("client_id", std::string());
+        if (clientId.empty()) {
+            throw std::runtime_error("client_id is required for terminal open");
+        }
+
+        auto response = server_.request_client(clientId, {
+            {"type", "pty_open"},
+            {"cwd", payload.value("cwd", std::string())},
+            {"rows", payload.value("rows", 24)},
+            {"cols", payload.value("cols", 80)},
+            {"shell", payload.value("shell", std::string())},
+        });
+
+        if (!response.value("ok", false)) {
+            throw std::runtime_error(response.value("error", std::string("failed to open PTY session")));
+        }
+
+        auto data = response.value("data", json::object());
+        {
+            std::lock_guard<std::mutex> lock(sessionsMutex_);
+            auto& session = browserSessions_[&conn];
+            session.clientId = clientId;
+            session.remoteSessionId = data.value("session_id", "");
+        }
+        send_json(conn, {
+            {"type", "pty_opened"},
+            {"client_id", clientId},
+            {"session_id", data.value("session_id", "")},
+            {"cwd", data.value("cwd", "")},
+            {"shell", data.value("shell", "")},
+        });
+    }
+
+    void handle_input(crow::websocket::connection& conn, const json& payload) {
+        auto session = require_browser_session(conn);
+        if (session.remoteSessionId.empty()) {
+            throw std::runtime_error("terminal session has not been opened");
+        }
+        auto response = server_.request_client(session.clientId, {
+            {"type", "pty_input"},
+            {"session_id", session.remoteSessionId},
+            {"data_base64", payload.value("data_base64", "")},
+        });
+        if (!response.value("ok", false)) {
+            throw std::runtime_error(response.value("error", std::string("failed to send PTY input")));
+        }
+    }
+
+    void handle_resize(crow::websocket::connection& conn, const json& payload) {
+        auto session = require_browser_session(conn);
+        if (session.remoteSessionId.empty()) {
+            return;
+        }
+        auto response = server_.request_client(session.clientId, {
+            {"type", "pty_resize"},
+            {"session_id", session.remoteSessionId},
+            {"rows", payload.value("rows", 24)},
+            {"cols", payload.value("cols", 80)},
+        });
+        if (!response.value("ok", false)) {
+            throw std::runtime_error(response.value("error", std::string("failed to resize PTY session")));
+        }
+    }
+
+    void handle_close(crow::websocket::connection& conn) {
+        BrowserSession session;
+        {
+            std::lock_guard<std::mutex> lock(sessionsMutex_);
+            auto it = browserSessions_.find(&conn);
+            if (it == browserSessions_.end()) {
+                return;
+            }
+            session = it->second;
+            it->second.remoteSessionId.clear();
+        }
+
+        if (session.clientId.empty() || session.remoteSessionId.empty()) {
+            return;
+        }
+
+        auto response = server_.request_client(session.clientId, {
+            {"type", "pty_close"},
+            {"session_id", session.remoteSessionId},
+        });
+        if (!response.value("ok", false)) {
+            throw std::runtime_error(response.value("error", std::string("failed to close PTY session")));
+        }
+    }
+
+    void forward_client_event(const std::string& clientId, const json& payload) {
+        const auto type = payload.value("type", "");
+        if (type != "pty_output" && type != "pty_exit") {
+            return;
+        }
+
+        const auto sessionId = payload.value("session_id", std::string());
+        std::vector<crow::websocket::connection*> targets;
+        {
+            std::lock_guard<std::mutex> lock(sessionsMutex_);
+            for (const auto& item : browserSessions_) {
+                if (item.second.clientId == clientId && item.second.remoteSessionId == sessionId) {
+                    targets.push_back(item.first);
+                }
+            }
+            if (type == "pty_exit") {
+                for (auto* target : targets) {
+                    auto it = browserSessions_.find(target);
+                    if (it != browserSessions_.end()) {
+                        it->second.remoteSessionId.clear();
+                    }
+                }
+            }
+        }
+
+        for (auto* target : targets) {
+            send_json(*target, payload);
+        }
+    }
+
+    void send_json(crow::websocket::connection& conn, const json& payload) {
+        std::lock_guard<std::mutex> lock(sendMutex_);
+        conn.send_text(payload.dump());
+    }
+
+    LemonTeaServer& server_;
+    int subscriptionId_ = 0;
+    std::mutex sessionsMutex_;
+    std::unordered_map<crow::websocket::connection*, BrowserSession> browserSessions_;
+    std::mutex sendMutex_;
 };
 
 }  // namespace
@@ -824,6 +1097,7 @@ int main(int argc, char** argv) {
         crow::App<crow::CORSHandler> app;
         auto& cors = app.get_middleware<crow::CORSHandler>();
         cors.global().origin("*").methods("GET"_method, "POST"_method, "OPTIONS"_method).headers("Content-Type");
+        auto terminalBridge = std::make_shared<TerminalBridge>(server);
 
         CROW_ROUTE(app, "/health")([&server] {
             return json_response({
@@ -881,6 +1155,41 @@ int main(int argc, char** argv) {
                     {"type", "write_file"},
                     {"path", body.value("path", "")},
                     {"content_base64", body.value("content_base64", "")},
+                });
+                return json_response(response);
+            }
+        );
+
+        CROW_ROUTE(app, "/api/clients/<string>/directory/create").methods(crow::HTTPMethod::Post)(
+            [&server](const crow::request& request, const std::string& clientId) {
+                auto body = parse_body(request);
+                auto response = server.request_client(clientId, {
+                    {"type", "create_directory"},
+                    {"path", body.value("path", "")},
+                });
+                return json_response(response);
+            }
+        );
+
+        CROW_ROUTE(app, "/api/clients/<string>/path/rename").methods(crow::HTTPMethod::Post)(
+            [&server](const crow::request& request, const std::string& clientId) {
+                auto body = parse_body(request);
+                auto response = server.request_client(clientId, {
+                    {"type", "rename_path"},
+                    {"old_path", body.value("old_path", "")},
+                    {"new_path", body.value("new_path", "")},
+                });
+                return json_response(response);
+            }
+        );
+
+        CROW_ROUTE(app, "/api/clients/<string>/path/delete").methods(crow::HTTPMethod::Post)(
+            [&server](const crow::request& request, const std::string& clientId) {
+                auto body = parse_body(request);
+                auto response = server.request_client(clientId, {
+                    {"type", "delete_path"},
+                    {"path", body.value("path", "")},
+                    {"recursive", body.value("recursive", true)},
                 });
                 return json_response(response);
             }
@@ -958,6 +1267,17 @@ int main(int argc, char** argv) {
                 return json_response({{"ok", true}, {"plugin", pluginName}, {"stopped", true}});
             }
         );
+
+        CROW_WEBSOCKET_ROUTE(app, "/ws/pty")
+            .onopen([terminalBridge](crow::websocket::connection& conn) {
+                terminalBridge->on_open(conn);
+            })
+            .onclose([terminalBridge](crow::websocket::connection& conn, const std::string&) {
+                terminalBridge->on_close(conn);
+            })
+            .onmessage([terminalBridge](crow::websocket::connection& conn, const std::string& data, bool isBinary) {
+                terminalBridge->on_message(conn, data, isBinary);
+            });
 
         if (config.transport.mode == TransportMode::Tcp) {
             log_line("INFO", "TCP listen on 0.0.0.0:" + std::to_string(config.transport.tcpListenPort));

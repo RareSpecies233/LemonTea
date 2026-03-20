@@ -33,6 +33,8 @@ set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
 set(NO_MEDIA ON CACHE BOOL "" FORCE)
 set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
 set(NO_TESTS ON CACHE BOOL "" FORCE)
+set(USE_MBEDTLS OFF CACHE BOOL "" FORCE)
+set(USE_OPENSSL ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
   libdatachannel
   GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git
