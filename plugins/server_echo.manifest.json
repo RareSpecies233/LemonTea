@@ -1,6 +1,9 @@
 {
   "name": "server_echo",
   "description": "server-side subprocess test plugin",
+  "version": "1.0.0",
+  "protocol_version": 1,
+  "capabilities": ["echo", "get_status"],
   "executable": "python3",
   "script": "server_echo_plugin.py",
   "port": 9201,

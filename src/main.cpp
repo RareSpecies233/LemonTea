@@ -4,12 +4,17 @@
 #include <nlohmann/json.hpp>
 #include <rtc/rtc.hpp>
 
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -47,6 +52,41 @@ void log_line(const std::string& level, const std::string& message) {
     std::cout << "[" << now_string() << "] [LemonTea] [" << level << "] " << message << std::endl;
 }
 
+std::atomic<bool> g_cleanupStarted{false};
+std::function<void()> g_processCleanup;
+
+void run_registered_cleanup() noexcept {
+    if (g_cleanupStarted.exchange(true)) {
+        return;
+    }
+    try {
+        if (g_processCleanup) {
+            g_processCleanup();
+        }
+    } catch (...) {
+    }
+}
+
+void register_process_cleanup(std::function<void()> cleanup) {
+    g_processCleanup = std::move(cleanup);
+}
+
+void process_signal_handler(int signum) {
+    run_registered_cleanup();
+    std::_Exit(128 + signum);
+}
+
+void install_process_handlers() {
+    std::atexit(run_registered_cleanup);
+    std::set_terminate([] {
+        run_registered_cleanup();
+        std::abort();
+    });
+    std::signal(SIGINT, process_signal_handler);
+    std::signal(SIGTERM, process_signal_handler);
+    std::signal(SIGABRT, process_signal_handler);
+}
+
 json read_json_file(const fs::path& path) {
     std::ifstream input(path);
     if (!input) {
@@ -55,6 +95,80 @@ json read_json_file(const fs::path& path) {
     json value;
     input >> value;
     return value;
+}
+
+std::vector<unsigned char> base64_decode(const std::string& input) {
+    static const std::array<int, 256> table = [] {
+        std::array<int, 256> lookup{};
+        lookup.fill(-1);
+        const std::string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (size_t index = 0; index < chars.size(); ++index) {
+            lookup[static_cast<unsigned char>(chars[index])] = static_cast<int>(index);
+        }
+        return lookup;
+    }();
+
+    std::vector<unsigned char> output;
+    int value = 0;
+    int valb = -8;
+    for (unsigned char c : input) {
+        if (table[c] == -1) {
+            if (c == '=') {
+                break;
+            }
+            continue;
+        }
+        value = (value << 6) + table[c];
+        valb += 6;
+        if (valb >= 0) {
+            output.push_back(static_cast<unsigned char>((value >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return output;
+}
+
+bool is_valid_plugin_name(const std::string& name) {
+    if (name.empty()) {
+        return false;
+    }
+    for (unsigned char ch : name) {
+        if (!(std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fs::path validated_relative_path(const std::string& rawPath) {
+    fs::path path(rawPath);
+    if (rawPath.empty() || path.is_absolute()) {
+        throw std::runtime_error("plugin file path must be a non-empty relative path");
+    }
+    for (const auto& part : path) {
+        if (part == "..") {
+            throw std::runtime_error("plugin file path must not escape install directory: " + rawPath);
+        }
+    }
+    return path.lexically_normal();
+}
+
+std::string peer_state_name(rtc::PeerConnection::State state) {
+    switch (state) {
+        case rtc::PeerConnection::State::New:
+            return "new";
+        case rtc::PeerConnection::State::Connecting:
+            return "connecting";
+        case rtc::PeerConnection::State::Connected:
+            return "connected";
+        case rtc::PeerConnection::State::Disconnected:
+            return "disconnected";
+        case rtc::PeerConnection::State::Failed:
+            return "failed";
+        case rtc::PeerConnection::State::Closed:
+            return "closed";
+    }
+    return "unknown";
 }
 
 void write_json_line(tcp::socket& socket, const json& payload) {
@@ -105,6 +219,7 @@ struct Config {
     uint16_t httpPort;
     int requestTimeoutMs;
     std::vector<fs::path> pluginManifestPaths;
+    fs::path pluginInstallRoot;
 };
 
 Config load_config(const fs::path& path) {
@@ -124,6 +239,7 @@ Config load_config(const fs::path& path) {
     config.httpHost = raw.value("http_host", "0.0.0.0");
     config.httpPort = static_cast<uint16_t>(raw.value("http_port", 18080));
     config.requestTimeoutMs = raw.value("request_timeout_ms", 15000);
+    config.pluginInstallRoot = fs::weakly_canonical(root / raw.value("plugin_install_root", std::string{"../plugins/installed"}));
     for (const auto& item : raw.value("plugin_manifests", std::vector<std::string>{})) {
         config.pluginManifestPaths.push_back(fs::weakly_canonical(root / item));
     }
@@ -151,11 +267,15 @@ crow::response json_response(const json& payload, int code = 200) {
 struct PluginManifest {
     std::string name;
     std::string description;
+    std::string version;
     std::string executable;
     std::string script;
     uint16_t port;
     bool autoStart;
+    int protocolVersion;
+    std::vector<std::string> capabilities;
     fs::path baseDirectory;
+    fs::path manifestPath;
 };
 
 struct PluginRuntime {
@@ -165,20 +285,12 @@ struct PluginRuntime {
 
 class PluginManager {
 public:
-    explicit PluginManager(asio::io_context& io) : io_(io) {}
+    PluginManager(asio::io_context& io, fs::path installRoot)
+        : io_(io), installRoot_(std::move(installRoot)) {}
 
     void load(const std::vector<fs::path>& manifestPaths) {
         for (const auto& manifestPath : manifestPaths) {
-            auto raw = read_json_file(manifestPath);
-            PluginManifest manifest;
-            manifest.name = raw.at("name").get<std::string>();
-            manifest.description = raw.value("description", manifest.name);
-            manifest.executable = raw.value("executable", "python3");
-            manifest.script = raw.at("script").get<std::string>();
-            manifest.port = static_cast<uint16_t>(raw.value("port", 9200));
-            manifest.autoStart = raw.value("auto_start", true);
-            manifest.baseDirectory = manifestPath.parent_path();
-            plugins_.emplace(manifest.name, PluginRuntime{manifest});
+            load_manifest_file(manifestPath, false);
         }
     }
 
@@ -190,22 +302,17 @@ public:
         }
     }
 
-    json list() const {
+    json list() {
+        refresh_process_states();
         json items = json::array();
         for (const auto& [name, runtime] : plugins_) {
-            items.push_back(
-                {
-                    {"name", runtime.manifest.name},
-                    {"description", runtime.manifest.description},
-                    {"port", runtime.manifest.port},
-                    {"running", runtime.pid > 0},
-                }
-            );
+            items.push_back(runtime_summary(runtime));
         }
         return items;
     }
 
     json call(const std::string& name, const std::string& action, const json& payload) {
+        refresh_process_states();
         auto* runtime = find(name);
         if (!runtime) {
             throw std::runtime_error("plugin not found: " + name);
@@ -219,6 +326,7 @@ public:
     }
 
     void start_plugin(const std::string& name) {
+        refresh_process_states();
         auto* runtime = find(name);
         if (!runtime) {
             throw std::runtime_error("plugin not found: " + name);
@@ -232,6 +340,7 @@ public:
             throw std::runtime_error("fork failed for plugin: " + name);
         }
         if (pid == 0) {
+            setpgid(0, 0);
             chdir(runtime->manifest.baseDirectory.c_str());
             std::string port = std::to_string(runtime->manifest.port);
             execlp(
@@ -243,35 +352,185 @@ public:
             );
             _exit(127);
         }
+        setpgid(pid, pid);
         runtime->pid = pid;
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         log_line("INFO", "started server plugin " + name);
     }
 
     void stop_plugin(const std::string& name) {
+        refresh_process_states();
         auto* runtime = find(name);
         if (!runtime) {
             throw std::runtime_error("plugin not found: " + name);
         }
         if (runtime->pid > 0) {
-            kill(runtime->pid, SIGTERM);
-            waitpid(runtime->pid, nullptr, 0);
+            terminate_process_group(runtime->pid);
             runtime->pid = -1;
             log_line("INFO", "stopped server plugin " + name);
         }
     }
 
     void stop_all() {
+        refresh_process_states();
         for (auto& [name, runtime] : plugins_) {
             if (runtime.pid > 0) {
-                kill(runtime.pid, SIGTERM);
-                waitpid(runtime.pid, nullptr, 0);
+                terminate_process_group(runtime.pid);
                 runtime.pid = -1;
             }
         }
     }
 
+    void emergency_stop_all() noexcept {
+        for (auto& [name, runtime] : plugins_) {
+            if (runtime.pid > 0) {
+                kill_process_group(runtime.pid, SIGTERM);
+                runtime.pid = -1;
+            }
+        }
+    }
+
+    json install(const json& manifestRaw, const json& filesPayload, bool replaceExisting) {
+        refresh_process_states();
+
+        const auto name = manifestRaw.value("name", std::string());
+        if (!is_valid_plugin_name(name)) {
+            throw std::runtime_error("plugin manifest must provide a safe name using letters, numbers, '.', '_' or '-'");
+        }
+
+        fs::create_directories(installRoot_);
+        auto installDirectory = installRoot_ / name;
+        if (fs::exists(installDirectory)) {
+            if (!replaceExisting) {
+                throw std::runtime_error("plugin already exists: " + name);
+            }
+            stop_plugin(name);
+            plugins_.erase(name);
+            fs::remove_all(installDirectory);
+        }
+
+        fs::create_directories(installDirectory);
+        for (const auto& file : filesPayload) {
+            auto relativePath = validated_relative_path(file.at("path").get<std::string>());
+            auto targetPath = installDirectory / relativePath;
+            fs::create_directories(targetPath.parent_path());
+            auto content = base64_decode(file.at("content_base64").get<std::string>());
+            std::ofstream output(targetPath, std::ios::binary);
+            output.write(reinterpret_cast<const char*>(content.data()), static_cast<std::streamsize>(content.size()));
+        }
+
+        auto manifestPath = installDirectory / "plugin.manifest.json";
+        {
+            std::ofstream output(manifestPath);
+            output << manifestRaw.dump(2);
+        }
+
+        auto& runtime = load_manifest_file(manifestPath, true);
+        auto entryScript = runtime.manifest.baseDirectory / runtime.manifest.script;
+        if (!fs::exists(entryScript)) {
+            plugins_.erase(runtime.manifest.name);
+            throw std::runtime_error("plugin entry script not found after installation: " + entryScript.string());
+        }
+        if (runtime.manifest.autoStart) {
+            start_plugin(runtime.manifest.name);
+        }
+        return runtime_summary(runtime);
+    }
+
 private:
+    static void kill_process_group(pid_t pid, int signum) noexcept {
+        if (pid <= 0) {
+            return;
+        }
+        if (killpg(pid, signum) != 0 && errno == ESRCH) {
+            kill(pid, signum);
+        }
+    }
+
+    static void terminate_process_group(pid_t pid) {
+        if (pid <= 0) {
+            return;
+        }
+        kill_process_group(pid, SIGTERM);
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            int status = 0;
+            auto result = waitpid(pid, &status, WNOHANG);
+            if (result == pid) {
+                return;
+            }
+            if (result == -1 && errno == ECHILD) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        kill_process_group(pid, SIGKILL);
+        waitpid(pid, nullptr, 0);
+    }
+
+    PluginManifest parse_manifest(const json& raw, const fs::path& manifestPath) const {
+        PluginManifest manifest;
+        manifest.name = raw.at("name").get<std::string>();
+        if (!is_valid_plugin_name(manifest.name)) {
+            throw std::runtime_error("invalid plugin name: " + manifest.name);
+        }
+        manifest.description = raw.value("description", manifest.name);
+        manifest.version = raw.value("version", std::string{"1.0.0"});
+        manifest.executable = raw.value("executable", std::string{"python3"});
+        manifest.script = validated_relative_path(raw.at("script").get<std::string>()).generic_string();
+        manifest.port = static_cast<uint16_t>(raw.value("port", 9200));
+        if (manifest.port == 0) {
+            throw std::runtime_error("plugin port must be greater than 0");
+        }
+        manifest.autoStart = raw.value("auto_start", true);
+        manifest.protocolVersion = raw.value("protocol_version", 1);
+        manifest.capabilities = raw.value("capabilities", std::vector<std::string>{});
+        manifest.baseDirectory = manifestPath.parent_path();
+        manifest.manifestPath = manifestPath;
+        return manifest;
+    }
+
+    PluginRuntime& load_manifest_file(const fs::path& manifestPath, bool replaceExisting) {
+        PluginRuntime runtime{parse_manifest(read_json_file(manifestPath), manifestPath)};
+        auto it = plugins_.find(runtime.manifest.name);
+        if (it != plugins_.end()) {
+            if (!replaceExisting) {
+                throw std::runtime_error("duplicate plugin name: " + runtime.manifest.name);
+            }
+            it->second = std::move(runtime);
+            return it->second;
+        }
+        auto [inserted, _] = plugins_.emplace(runtime.manifest.name, std::move(runtime));
+        return inserted->second;
+    }
+
+    json runtime_summary(const PluginRuntime& runtime) const {
+        return {
+            {"name", runtime.manifest.name},
+            {"description", runtime.manifest.description},
+            {"version", runtime.manifest.version},
+            {"port", runtime.manifest.port},
+            {"running", runtime.pid > 0},
+            {"auto_start", runtime.manifest.autoStart},
+            {"protocol_version", runtime.manifest.protocolVersion},
+            {"capabilities", runtime.manifest.capabilities},
+            {"manifest_path", runtime.manifest.manifestPath.string()},
+        };
+    }
+
+    void refresh_process_states() {
+        for (auto& [name, runtime] : plugins_) {
+            if (runtime.pid <= 0) {
+                continue;
+            }
+            int status = 0;
+            auto result = waitpid(runtime.pid, &status, WNOHANG);
+            if (result == runtime.pid || (result == -1 && errno == ECHILD)) {
+                runtime.pid = -1;
+                log_line("INFO", "server plugin exited: " + name);
+            }
+        }
+    }
+
     PluginRuntime* find(const std::string& name) {
         auto it = plugins_.find(name);
         if (it == plugins_.end()) {
@@ -281,6 +540,7 @@ private:
     }
 
     asio::io_context& io_;
+    fs::path installRoot_;
     std::map<std::string, PluginRuntime> plugins_;
 };
 
@@ -307,6 +567,7 @@ public:
 
     ~TcpClientSession() override {
         close();
+        join();
     }
 
     void start() override {
@@ -429,6 +690,7 @@ public:
 
     ~WebRtcClientSession() override {
         close();
+        join();
     }
 
     void start() override {
@@ -517,6 +779,7 @@ public:
 private:
     void configure_peer() {
         peerConnection_->onStateChange([this](rtc::PeerConnection::State state) {
+            log_line("INFO", "WebRTC state for " + clientId_ + " -> " + peer_state_name(state));
             if (state == rtc::PeerConnection::State::Disconnected ||
                 state == rtc::PeerConnection::State::Failed ||
                 state == rtc::PeerConnection::State::Closed) {
@@ -623,17 +886,40 @@ private:
                 if (payload.is_null() || payload.empty()) {
                     continue;
                 }
-                const auto type = payload.value("type", "");
-                if (type == "description") {
-                    peerConnection_->setRemoteDescription(rtc::Description(
-                        payload.at("sdp").get<std::string>(),
-                        payload.at("description_type").get<std::string>()
-                    ));
-                } else if (type == "candidate") {
-                    peerConnection_->addRemoteCandidate(rtc::Candidate(
-                        payload.at("candidate").get<std::string>(),
-                        payload.value("mid", "")
-                    ));
+                try {
+                    const auto type = payload.value("type", "");
+                    if (type == "description") {
+                        peerConnection_->setRemoteDescription(rtc::Description(
+                            payload.at("sdp").get<std::string>(),
+                            payload.at("description_type").get<std::string>()
+                        ));
+
+                        std::vector<std::pair<std::string, std::string>> pendingCandidates;
+                        {
+                            std::lock_guard<std::mutex> lock(signalStateMutex_);
+                            remoteDescriptionSet_ = true;
+                            pendingCandidates.swap(pendingRemoteCandidates_);
+                        }
+                        for (const auto& candidate : pendingCandidates) {
+                            peerConnection_->addRemoteCandidate(rtc::Candidate(candidate.first, candidate.second));
+                        }
+                    } else if (type == "candidate") {
+                        const auto candidate = payload.at("candidate").get<std::string>();
+                        const auto mid = payload.value("mid", std::string());
+                        bool shouldQueue = false;
+                        {
+                            std::lock_guard<std::mutex> lock(signalStateMutex_);
+                            shouldQueue = !remoteDescriptionSet_;
+                            if (shouldQueue) {
+                                pendingRemoteCandidates_.emplace_back(candidate, mid);
+                            }
+                        }
+                        if (!shouldQueue) {
+                            peerConnection_->addRemoteCandidate(rtc::Candidate(candidate, mid));
+                        }
+                    }
+                } catch (const std::exception& ex) {
+                    log_line("ERROR", "WebRTC signaling payload failed for " + clientId_ + ": " + ex.what());
                 }
             }
         } catch (const std::exception& ex) {
@@ -655,6 +941,9 @@ private:
     mutable std::mutex dataChannelMutex_;
     std::shared_ptr<rtc::DataChannel> dataChannel_;
     std::mutex signalWriteMutex_;
+    std::mutex signalStateMutex_;
+    bool remoteDescriptionSet_ = false;
+    std::vector<std::pair<std::string, std::string>> pendingRemoteCandidates_;
     std::atomic<bool> connected_{false};
     std::string lastSeen_ = now_string();
     std::mutex responseMutex_;
@@ -673,7 +962,7 @@ public:
     explicit LemonTeaServer(Config config)
         : config_(std::move(config)),
           io_(),
-          plugins_(io_) {
+                    plugins_(io_, config_.pluginInstallRoot) {
         if (config_.transport.mode == TransportMode::Tcp) {
             tcpAcceptor_ = std::make_unique<tcp::acceptor>(io_, tcp::endpoint(tcp::v4(), config_.transport.tcpListenPort));
         } else {
@@ -743,6 +1032,10 @@ public:
 
     PluginManager& plugins() {
         return plugins_;
+    }
+
+    void emergency_cleanup() noexcept {
+        plugins_.emergency_stop_all();
     }
 
     std::string transport_name() const {
@@ -1088,9 +1381,13 @@ private:
 
 int main(int argc, char** argv) {
     try {
+        install_process_handlers();
         fs::path configPath = argc > 1 ? fs::path(argv[1]) : fs::path("config/server.example.json");
         auto config = load_config(configPath);
         LemonTeaServer server(config);
+        register_process_cleanup([&server] {
+            server.emergency_cleanup();
+        });
         server.start();
 
         // Enable CORS so browser frontends can call the API from other origins.
@@ -1202,6 +1499,19 @@ int main(int argc, char** argv) {
             }
         );
 
+        CROW_ROUTE(app, "/api/clients/<string>/plugins/install").methods(crow::HTTPMethod::Post)(
+            [&server](const crow::request& request, const std::string& clientId) {
+                auto body = parse_body(request);
+                auto response = server.request_client(clientId, {
+                    {"type", "plugin_install"},
+                    {"manifest", body.value("manifest", json::object())},
+                    {"files", body.value("files", json::array())},
+                    {"replace", body.value("replace", false)},
+                });
+                return json_response(response);
+            }
+        );
+
         CROW_ROUTE(app, "/api/clients/<string>/plugins/<string>/call").methods(crow::HTTPMethod::Post)(
             [&server](const crow::request& request, const std::string& clientId, const std::string& pluginName) {
                 auto body = parse_body(request);
@@ -1241,6 +1551,18 @@ int main(int argc, char** argv) {
                 {"plugins", server.plugins().list()},
             });
         });
+
+        CROW_ROUTE(app, "/api/server/plugins/install").methods(crow::HTTPMethod::Post)(
+            [&server](const crow::request& request) {
+                auto body = parse_body(request);
+                auto response = server.plugins().install(
+                    body.value("manifest", json::object()),
+                    body.value("files", json::array()),
+                    body.value("replace", false)
+                );
+                return json_response({{"ok", true}, {"plugin", response}});
+            }
+        );
 
         CROW_ROUTE(app, "/api/server/plugins/<string>/call").methods(crow::HTTPMethod::Post)(
             [&server](const crow::request& request, const std::string& pluginName) {

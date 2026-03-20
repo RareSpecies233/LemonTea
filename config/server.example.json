@@ -10,6 +10,7 @@
   "http_host": "0.0.0.0",
   "http_port": 38085,
   "request_timeout_ms": 15000,
+  "plugin_install_root": "../plugins/installed",
   "plugin_manifests": [
     "../plugins/server_echo.manifest.json"
   ]
