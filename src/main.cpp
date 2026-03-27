@@ -1659,6 +1659,7 @@ int main(int argc, char** argv) {
                         {"filename", body.value("filename", std::string("honeytea"))},
                         {"content_base64", body.value("content_base64", "")},
                         {"staged_path", body.value("staged_path", "")},
+                        {"restart_only", body.value("restart_only", false)},
                     });
                 });
             }
