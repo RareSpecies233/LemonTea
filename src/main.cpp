@@ -1138,7 +1138,17 @@ public:
 
     json request_client(const std::string& clientId, json request) {
         auto session = get_client(clientId);
-        return session->send_request(std::move(request), config_.requestTimeoutMs);
+        const auto type = request.value("type", std::string());
+        int timeoutMs = config_.requestTimeoutMs;
+        if (type == "read_file_chunk" || type == "write_file" || type == "firmware_update") {
+            timeoutMs = std::max(timeoutMs, 120000);
+        } else if (type == "read_file" || type == "list_files" || type == "create_directory" ||
+                   type == "rename_path" || type == "delete_path" || type == "plugin_install") {
+            timeoutMs = std::max(timeoutMs, 45000);
+        } else if (type == "plugin_call" || type == "plugin_start" || type == "plugin_stop") {
+            timeoutMs = std::max(timeoutMs, 30000);
+        }
+        return session->send_request(std::move(request), timeoutMs);
     }
 
     PluginManager& plugins() {
@@ -1347,6 +1357,35 @@ private:
         std::string remoteSessionId;
     };
 
+    static bool is_pty_missing_session_error(const json& response) {
+        const auto message = response.value("error", std::string());
+        return message.find("PTY session not found") != std::string::npos;
+    }
+
+    void clear_remote_session(crow::websocket::connection& conn, int exitCode, const std::string& reason) {
+        std::string sessionId;
+        {
+            std::lock_guard<std::mutex> lock(sessionsMutex_);
+            auto it = browserSessions_.find(&conn);
+            if (it == browserSessions_.end()) {
+                return;
+            }
+            sessionId = it->second.remoteSessionId;
+            it->second.remoteSessionId.clear();
+        }
+
+        if (sessionId.empty()) {
+            return;
+        }
+
+        send_json(conn, {
+            {"type", "pty_exit"},
+            {"session_id", sessionId},
+            {"exit_code", exitCode},
+            {"reason", reason},
+        });
+    }
+
     BrowserSession require_browser_session(crow::websocket::connection& conn) {
         std::lock_guard<std::mutex> lock(sessionsMutex_);
         auto it = browserSessions_.find(&conn);
@@ -1393,7 +1432,7 @@ private:
     void handle_input(crow::websocket::connection& conn, const json& payload) {
         auto session = require_browser_session(conn);
         if (session.remoteSessionId.empty()) {
-            throw std::runtime_error("terminal session has not been opened");
+            return;
         }
         auto response = server_.request_client(session.clientId, {
             {"type", "pty_input"},
@@ -1401,6 +1440,10 @@ private:
             {"data_base64", payload.value("data_base64", "")},
         });
         if (!response.value("ok", false)) {
+            if (is_pty_missing_session_error(response)) {
+                clear_remote_session(conn, 0, "missing_session");
+                return;
+            }
             throw std::runtime_error(response.value("error", std::string("failed to send PTY input")));
         }
     }
@@ -1417,6 +1460,10 @@ private:
             {"cols", payload.value("cols", 80)},
         });
         if (!response.value("ok", false)) {
+            if (is_pty_missing_session_error(response)) {
+                clear_remote_session(conn, 0, "missing_session");
+                return;
+            }
             throw std::runtime_error(response.value("error", std::string("failed to resize PTY session")));
         }
     }
@@ -1442,6 +1489,9 @@ private:
             {"session_id", session.remoteSessionId},
         });
         if (!response.value("ok", false)) {
+            if (is_pty_missing_session_error(response)) {
+                return;
+            }
             throw std::runtime_error(response.value("error", std::string("failed to close PTY session")));
         }
     }
