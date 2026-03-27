@@ -1623,6 +1623,20 @@ int main(int argc, char** argv) {
             }
         );
 
+        CROW_ROUTE(app, "/api/clients/<string>/firmware").methods(crow::HTTPMethod::Post)(
+            [&server](const crow::request& request, const std::string& clientId) {
+                return guarded_json_response([&] {
+                    const auto decodedClientId = url_decode(clientId);
+                    auto body = parse_body(request);
+                    return server.request_client(decodedClientId, {
+                        {"type", "firmware_update"},
+                        {"filename", body.value("filename", std::string("honeytea"))},
+                        {"content_base64", body.value("content_base64", "")},
+                    });
+                });
+            }
+        );
+
         CROW_ROUTE(app, "/api/server/plugins").methods(crow::HTTPMethod::Get)([&server] {
             return guarded_json_response([&] {
                 return json{
