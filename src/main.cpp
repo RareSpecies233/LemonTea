@@ -253,6 +253,30 @@ json parse_body(const crow::request& request) {
     return json::parse(request.body);
 }
 
+std::string url_decode(std::string_view input) {
+    std::string output;
+    output.reserve(input.size());
+    for (size_t index = 0; index < input.size(); ++index) {
+        const char ch = input[index];
+        if (ch == '%' && index + 2 < input.size()) {
+            const auto hex = std::string(input.substr(index + 1, 2));
+            char* end = nullptr;
+            const auto value = std::strtol(hex.c_str(), &end, 16);
+            if (end != nullptr && *end == '\0') {
+                output.push_back(static_cast<char>(value));
+                index += 2;
+                continue;
+            }
+        }
+        if (ch == '+') {
+            output.push_back(' ');
+        } else {
+            output.push_back(ch);
+        }
+    }
+    return output;
+}
+
 crow::response json_response(const json& payload, int code = 200) {
     crow::response response(code);
     response.set_header("Content-Type", "application/json; charset=utf-8");
@@ -1448,8 +1472,9 @@ int main(int argc, char** argv) {
         CROW_ROUTE(app, "/api/clients/<string>/shell").methods(crow::HTTPMethod::Post)(
             [&server](const crow::request& request, const std::string& clientId) {
                 return guarded_json_response([&] {
+                    const auto decodedClientId = url_decode(clientId);
                     auto body = parse_body(request);
-                    return server.request_client(clientId, {
+                    return server.request_client(decodedClientId, {
                         {"type", "shell_exec"},
                         {"command", body.value("command", "")},
                     });
@@ -1460,8 +1485,9 @@ int main(int argc, char** argv) {
         CROW_ROUTE(app, "/api/clients/<string>/files").methods(crow::HTTPMethod::Get)(
             [&server](const crow::request& request, const std::string& clientId) {
                 return guarded_json_response([&] {
+                    const auto decodedClientId = url_decode(clientId);
                     const char* path = request.url_params.get("path");
-                    return server.request_client(clientId, {
+                    return server.request_client(decodedClientId, {
                         {"type", "list_files"},
                         {"path", path ? std::string(path) : std::string()},
                     });
@@ -1472,8 +1498,9 @@ int main(int argc, char** argv) {
         CROW_ROUTE(app, "/api/clients/<string>/file").methods(crow::HTTPMethod::Get)(
             [&server](const crow::request& request, const std::string& clientId) {
                 return guarded_json_response([&] {
+                    const auto decodedClientId = url_decode(clientId);
                     const char* path = request.url_params.get("path");
-                    return server.request_client(clientId, {
+                    return server.request_client(decodedClientId, {
                         {"type", "read_file"},
                         {"path", path ? std::string(path) : std::string()},
                     });
@@ -1484,8 +1511,9 @@ int main(int argc, char** argv) {
         CROW_ROUTE(app, "/api/clients/<string>/file/write").methods(crow::HTTPMethod::Post)(
             [&server](const crow::request& request, const std::string& clientId) {
                 return guarded_json_response([&] {
+                    const auto decodedClientId = url_decode(clientId);
                     auto body = parse_body(request);
-                    return server.request_client(clientId, {
+                    return server.request_client(decodedClientId, {
                         {"type", "write_file"},
                         {"path", body.value("path", "")},
                         {"content_base64", body.value("content_base64", "")},
@@ -1497,8 +1525,9 @@ int main(int argc, char** argv) {
         CROW_ROUTE(app, "/api/clients/<string>/directory/create").methods(crow::HTTPMethod::Post)(
             [&server](const crow::request& request, const std::string& clientId) {
                 return guarded_json_response([&] {
+                    const auto decodedClientId = url_decode(clientId);
                     auto body = parse_body(request);
-                    return server.request_client(clientId, {
+                    return server.request_client(decodedClientId, {
                         {"type", "create_directory"},
                         {"path", body.value("path", "")},
                     });
@@ -1509,8 +1538,9 @@ int main(int argc, char** argv) {
         CROW_ROUTE(app, "/api/clients/<string>/path/rename").methods(crow::HTTPMethod::Post)(
             [&server](const crow::request& request, const std::string& clientId) {
                 return guarded_json_response([&] {
+                    const auto decodedClientId = url_decode(clientId);
                     auto body = parse_body(request);
-                    return server.request_client(clientId, {
+                    return server.request_client(decodedClientId, {
                         {"type", "rename_path"},
                         {"old_path", body.value("old_path", "")},
                         {"new_path", body.value("new_path", "")},
@@ -1522,8 +1552,9 @@ int main(int argc, char** argv) {
         CROW_ROUTE(app, "/api/clients/<string>/path/delete").methods(crow::HTTPMethod::Post)(
             [&server](const crow::request& request, const std::string& clientId) {
                 return guarded_json_response([&] {
+                    const auto decodedClientId = url_decode(clientId);
                     auto body = parse_body(request);
-                    return server.request_client(clientId, {
+                    return server.request_client(decodedClientId, {
                         {"type", "delete_path"},
                         {"path", body.value("path", "")},
                         {"recursive", body.value("recursive", true)},
@@ -1535,7 +1566,7 @@ int main(int argc, char** argv) {
         CROW_ROUTE(app, "/api/clients/<string>/plugins").methods(crow::HTTPMethod::Get)(
             [&server](const crow::request&, const std::string& clientId) {
                 return guarded_json_response([&] {
-                    return server.request_client(clientId, {{"type", "plugin_list"}});
+                    return server.request_client(url_decode(clientId), {{"type", "plugin_list"}});
                 });
             }
         );
@@ -1543,8 +1574,9 @@ int main(int argc, char** argv) {
         CROW_ROUTE(app, "/api/clients/<string>/plugins/install").methods(crow::HTTPMethod::Post)(
             [&server](const crow::request& request, const std::string& clientId) {
                 return guarded_json_response([&] {
+                    const auto decodedClientId = url_decode(clientId);
                     auto body = parse_body(request);
-                    return server.request_client(clientId, {
+                    return server.request_client(decodedClientId, {
                         {"type", "plugin_install"},
                         {"manifest", body.value("manifest", json::object())},
                         {"files", body.value("files", json::array())},
@@ -1557,8 +1589,9 @@ int main(int argc, char** argv) {
         CROW_ROUTE(app, "/api/clients/<string>/plugins/<string>/call").methods(crow::HTTPMethod::Post)(
             [&server](const crow::request& request, const std::string& clientId, const std::string& pluginName) {
                 return guarded_json_response([&] {
+                    const auto decodedClientId = url_decode(clientId);
                     auto body = parse_body(request);
-                    return server.request_client(clientId, {
+                    return server.request_client(decodedClientId, {
                         {"type", "plugin_call"},
                         {"plugin", pluginName},
                         {"action", body.value("action", "get_status")},
@@ -1571,7 +1604,7 @@ int main(int argc, char** argv) {
         CROW_ROUTE(app, "/api/clients/<string>/plugins/<string>/start").methods(crow::HTTPMethod::Post)(
             [&server](const crow::request&, const std::string& clientId, const std::string& pluginName) {
                 return guarded_json_response([&] {
-                    return server.request_client(clientId, {
+                    return server.request_client(url_decode(clientId), {
                         {"type", "plugin_start"},
                         {"plugin", pluginName},
                     });
@@ -1582,7 +1615,7 @@ int main(int argc, char** argv) {
         CROW_ROUTE(app, "/api/clients/<string>/plugins/<string>/stop").methods(crow::HTTPMethod::Post)(
             [&server](const crow::request&, const std::string& clientId, const std::string& pluginName) {
                 return guarded_json_response([&] {
-                    return server.request_client(clientId, {
+                    return server.request_client(url_decode(clientId), {
                         {"type", "plugin_stop"},
                         {"plugin", pluginName},
                     });
