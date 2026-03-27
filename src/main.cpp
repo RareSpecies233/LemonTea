@@ -48,8 +48,45 @@ std::string now_string() {
     return oss.str();
 }
 
+int log_severity(const std::string& level) {
+    if (level == "DEBUG") {
+        return 0;
+    }
+    if (level == "INFO") {
+        return 1;
+    }
+    return 2;
+}
+
 void log_line(const std::string& level, const std::string& message) {
+    if (log_severity(level) < 1) {
+        return;
+    }
     std::cout << "[" << now_string() << "] [LemonTea] [" << level << "] " << message << std::endl;
+}
+
+constexpr const char* kLemonTeaUpdateLogPath = "/tmp/lemontea-update.log";
+constexpr const char* kLemonTeaUpdateLauncherLogPath = "/tmp/lemontea-update-launcher.log";
+
+std::string read_text_tail(const fs::path& path, std::streamoff maxBytes = 8192) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        return std::string();
+    }
+
+    input.seekg(0, std::ios::end);
+    const auto size = input.tellg();
+    if (size <= 0) {
+        return std::string();
+    }
+
+    const auto start = std::max<std::streamoff>(0, size - maxBytes);
+    input.seekg(start, std::ios::beg);
+
+    std::string output(static_cast<size_t>(size - start), '\0');
+    input.read(output.data(), static_cast<std::streamsize>(output.size()));
+    output.resize(static_cast<size_t>(input.gcount()));
+    return output;
 }
 
 std::atomic<bool> g_cleanupStarted{false};
@@ -220,6 +257,8 @@ struct Config {
     int requestTimeoutMs;
     std::vector<fs::path> pluginManifestPaths;
     fs::path pluginInstallRoot;
+    fs::path executablePath;
+    fs::path configPath;
 };
 
 Config load_config(const fs::path& path) {
@@ -275,6 +314,25 @@ std::string url_decode(std::string_view input) {
         }
     }
     return output;
+}
+
+bool starts_with_path(const fs::path& root, const fs::path& target) {
+    const auto rootString = root.lexically_normal().generic_string();
+    const auto targetString = target.lexically_normal().generic_string();
+    return targetString == rootString || targetString.rfind(rootString + "/", 0) == 0;
+}
+
+std::string shell_quote(const std::string& value) {
+    std::string quoted = "'";
+    for (char ch : value) {
+        if (ch == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted.push_back(ch);
+        }
+    }
+    quoted += "'";
+    return quoted;
 }
 
 crow::response json_response(const json& payload, int code = 200) {
@@ -707,7 +765,7 @@ private:
                     if (eventCallback_) {
                         eventCallback_(clientId_, message);
                     }
-                    log_line("INFO", "unsolicited message type=" + type + " from " + clientId_);
+                    log_line("DEBUG", "unsolicited message type=" + type + " from " + clientId_);
                 }
             }
         } catch (const std::exception& ex) {
@@ -747,7 +805,7 @@ public:
     }
 
     void start() override {
-        rtc::InitLogger(rtc::LogLevel::Info);
+        rtc::InitLogger(rtc::LogLevel::Warning);
         rtc::Configuration rtcConfig;
         for (const auto& stunServer : stunServers_) {
             rtcConfig.iceServers.emplace_back(stunServer);
@@ -901,7 +959,7 @@ private:
                     if (eventCallback_) {
                         eventCallback_(clientId_, payload);
                     }
-                    log_line("INFO", "unsolicited WebRTC message type=" + type + " from " + clientId_);
+                    log_line("DEBUG", "unsolicited WebRTC message type=" + type + " from " + clientId_);
                 }
             } catch (const std::exception& ex) {
                 log_line("ERROR", std::string("failed to parse WebRTC payload for ") + clientId_ + ": " + ex.what());
@@ -1430,6 +1488,187 @@ private:
     std::mutex sendMutex_;
 };
 
+class RuntimeManager {
+public:
+    RuntimeManager(fs::path executablePath, fs::path configPath, std::function<void()> cleanup)
+        : executablePath_(std::move(executablePath)),
+          configPath_(std::move(configPath)),
+          cleanup_(std::move(cleanup)) {}
+
+    json stage_upload(const std::string& relativePath, const std::string& contentBase64, bool append) const {
+        auto target = stage_root() / validated_relative_path(relativePath);
+        fs::create_directories(target.parent_path());
+
+        auto data = base64_decode(contentBase64);
+        std::ofstream output(
+            target,
+            std::ios::binary | std::ios::out | (append ? std::ios::app : std::ios::trunc)
+        );
+        if (!output) {
+            throw std::runtime_error("failed to open runtime staging file: " + target.string());
+        }
+        output.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        output.flush();
+
+        std::error_code sizeError;
+        const auto finalSize = fs::file_size(target, sizeError);
+        return {
+            {"path", relativePath},
+            {"staged_path", target.string()},
+            {"written", static_cast<long long>(data.size())},
+            {"append", append},
+            {"size", sizeError ? -1 : static_cast<long long>(finalSize)},
+        };
+    }
+
+    json schedule_update(const std::string& filename, const std::string& stagedPath, bool restartOnly) {
+        if (executablePath_.empty()) {
+            throw std::runtime_error("current executable path is unknown");
+        }
+        if (updateScheduled_.exchange(true)) {
+            throw std::runtime_error("LemonTea update is already scheduled");
+        }
+
+        fs::remove(fs::path(kLemonTeaUpdateLogPath));
+        fs::remove(fs::path(kLemonTeaUpdateLauncherLogPath));
+
+        const auto restartScriptPath = executablePath_.string() + ".restart.sh";
+        auto stagedBinaryPath = executablePath_.string();
+        if (!restartOnly) {
+            auto resolvedStage = resolve_existing_stage_path(stagedPath);
+            if (!fs::exists(resolvedStage) || !fs::is_regular_file(resolvedStage)) {
+                throw std::runtime_error("staged LemonTea binary not found: " + resolvedStage.string());
+            }
+            stagedBinaryPath = resolvedStage.string();
+        }
+
+        {
+            std::ofstream script(restartScriptPath, std::ios::trunc);
+            script << "#!/bin/sh\n";
+            script << "set -eu\n";
+            script << "SRC=$1\n";
+            script << "DST=$2\n";
+            script << "CFG=$3\n";
+            script << "LOG='" << kLemonTeaUpdateLogPath << "'\n";
+            script << "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] update script started\" >> \"$LOG\"\n";
+            script << "sleep 1\n";
+            script << "if [ \"$SRC\" != \"$DST\" ]; then\n";
+            script << "  TMP=\"${DST}.tmp\"\n";
+            script << "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] copying staged binary\" >> \"$LOG\"\n";
+            script << "  cp \"$SRC\" \"$TMP\"\n";
+            script << "  chmod +x \"$TMP\"\n";
+            script << "  mv \"$TMP\" \"$DST\"\n";
+            script << "  rm -f \"$SRC\"\n";
+            script << "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] binary replaced\" >> \"$LOG\"\n";
+            script << "fi\n";
+            script << "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] launching LemonTea\" >> \"$LOG\"\n";
+            script << "nohup \"$DST\" \"$CFG\" >>\"$LOG\" 2>&1 &\n";
+            script << "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] restart launched\" >> \"$LOG\"\n";
+            script << "rm -f \"$0\"\n";
+        }
+
+        fs::permissions(
+            restartScriptPath,
+            fs::perms::owner_read | fs::perms::owner_write | fs::perms::owner_exec |
+                fs::perms::group_read | fs::perms::group_exec |
+                fs::perms::others_read | fs::perms::others_exec,
+            fs::perm_options::replace
+        );
+
+        std::thread([this, stagedBinaryPath, restartScriptPath] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+            {
+                std::ofstream launcherLog(kLemonTeaUpdateLauncherLogPath, std::ios::app);
+                launcherLog << "[" << now_string() << "] launching restart script" << std::endl;
+            }
+
+            const auto launchCommand =
+                std::string("nohup /bin/sh ") +
+                shell_quote(restartScriptPath) + " " +
+                shell_quote(stagedBinaryPath) + " " +
+                shell_quote(executablePath_.string()) + " " +
+                shell_quote(configPath_.string()) +
+                " >>" + shell_quote(kLemonTeaUpdateLauncherLogPath) + " 2>&1 &";
+            std::system(launchCommand.c_str());
+            if (cleanup_) {
+                cleanup_();
+            }
+            std::_Exit(0);
+        }).detach();
+
+        return {
+            {"scheduled", true},
+            {"filename", filename},
+            {"staged_path", stagedBinaryPath},
+            {"target_path", executablePath_.string()},
+            {"config_path", configPath_.string()},
+            {"restart_only", restartOnly},
+            {"message", "LemonTea update scheduled, service will restart automatically"},
+        };
+    }
+
+    json status() const {
+        const std::string updateLog = read_text_tail(fs::path(kLemonTeaUpdateLogPath));
+        const std::string launcherLog = read_text_tail(fs::path(kLemonTeaUpdateLauncherLogPath));
+
+        std::string stage = "idle";
+        if (updateScheduled_.load()) {
+            stage = "scheduled";
+        }
+        if (launcherLog.find("launching restart script") != std::string::npos) {
+            stage = "launcher_started";
+        }
+        if (updateLog.find("copying staged binary") != std::string::npos) {
+            stage = "replacing_binary";
+        }
+        if (updateLog.find("binary replaced") != std::string::npos) {
+            stage = "binary_replaced";
+        }
+        if (updateLog.find("launching LemonTea") != std::string::npos) {
+            stage = "restarting";
+        }
+        if (updateLog.find("restart launched") != std::string::npos) {
+            stage = "restart_launched";
+        }
+
+        return {
+            {"scheduled", updateScheduled_.load()},
+            {"stage", stage},
+            {"log_path", kLemonTeaUpdateLogPath},
+            {"launcher_log_path", kLemonTeaUpdateLauncherLogPath},
+            {"log_excerpt", updateLog},
+            {"launcher_log_excerpt", launcherLog},
+        };
+    }
+
+private:
+    static fs::path stage_root() {
+        return fs::temp_directory_path() / "lemontea-runtime-stage";
+    }
+
+    static fs::path resolve_existing_stage_path(const std::string& rawPath) {
+        if (rawPath.empty()) {
+            throw std::runtime_error("staged LemonTea binary path is required");
+        }
+
+        fs::path candidate(rawPath);
+        if (candidate.is_relative()) {
+            return stage_root() / validated_relative_path(rawPath);
+        }
+
+        auto normalized = fs::weakly_canonical(candidate);
+        if (!starts_with_path(stage_root(), normalized)) {
+            throw std::runtime_error("staged LemonTea binary must stay inside runtime staging directory");
+        }
+        return normalized;
+    }
+
+    fs::path executablePath_;
+    fs::path configPath_;
+    std::function<void()> cleanup_;
+    std::atomic<bool> updateScheduled_{false};
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1437,16 +1676,24 @@ int main(int argc, char** argv) {
         install_process_handlers();
         fs::path configPath = argc > 1 ? fs::path(argv[1]) : fs::path("config/server.example.json");
         auto config = load_config(configPath);
+        config.configPath = fs::absolute(configPath).lexically_normal();
+        config.executablePath = fs::absolute(fs::path(argv[0])).lexically_normal();
         LemonTeaServer server(config);
         register_process_cleanup([&server] {
             server.emergency_cleanup();
         });
         server.start();
+        auto runtimeManager = std::make_shared<RuntimeManager>(
+            config.executablePath,
+            config.configPath,
+            [&server] { server.emergency_cleanup(); }
+        );
 
         // Enable CORS so browser frontends can call the API from other origins.
         crow::App<crow::CORSHandler> app;
         auto& cors = app.get_middleware<crow::CORSHandler>();
         cors.global().origin("*").methods("GET"_method, "POST"_method, "OPTIONS"_method).headers("Content-Type");
+        app.loglevel(crow::LogLevel::Warning);
         auto terminalBridge = std::make_shared<TerminalBridge>(server);
 
         CROW_ROUTE(app, "/health")([&server] {
@@ -1665,6 +1912,16 @@ int main(int argc, char** argv) {
             }
         );
 
+        CROW_ROUTE(app, "/api/clients/<string>/firmware/status").methods(crow::HTTPMethod::Get)(
+            [&server](const crow::request&, const std::string& clientId) {
+                return guarded_json_response([&] {
+                    return server.request_client(url_decode(clientId), {
+                        {"type", "firmware_status"},
+                    });
+                });
+            }
+        );
+
         CROW_ROUTE(app, "/api/server/plugins").methods(crow::HTTPMethod::Get)([&server] {
             return guarded_json_response([&] {
                 return json{
@@ -1715,6 +1972,40 @@ int main(int argc, char** argv) {
                 return guarded_json_response([&] {
                     server.plugins().stop_plugin(pluginName);
                     return json{{"ok", true}, {"plugin", pluginName}, {"stopped", true}};
+                });
+            }
+        );
+
+        CROW_ROUTE(app, "/api/server/runtime/status").methods(crow::HTTPMethod::Get)(
+            [runtimeManager](const crow::request&) {
+                return guarded_json_response([&] {
+                    return runtimeManager->status();
+                });
+            }
+        );
+
+        CROW_ROUTE(app, "/api/server/runtime/file/write").methods(crow::HTTPMethod::Post)(
+            [runtimeManager](const crow::request& request) {
+                return guarded_json_response([&] {
+                    auto body = parse_body(request);
+                    return runtimeManager->stage_upload(
+                        body.value("path", std::string()),
+                        body.value("content_base64", std::string()),
+                        body.value("append", false)
+                    );
+                });
+            }
+        );
+
+        CROW_ROUTE(app, "/api/server/runtime").methods(crow::HTTPMethod::Post)(
+            [runtimeManager](const crow::request& request) {
+                return guarded_json_response([&] {
+                    auto body = parse_body(request);
+                    return runtimeManager->schedule_update(
+                        body.value("filename", std::string("lemontea")),
+                        body.value("staged_path", std::string()),
+                        body.value("restart_only", false)
+                    );
                 });
             }
         );
