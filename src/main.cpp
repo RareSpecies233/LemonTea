@@ -1517,6 +1517,7 @@ int main(int argc, char** argv) {
                         {"type", "write_file"},
                         {"path", body.value("path", "")},
                         {"content_base64", body.value("content_base64", "")},
+                        {"append", body.value("append", false)},
                     });
                 });
             }
