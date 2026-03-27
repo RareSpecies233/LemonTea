@@ -1508,6 +1508,31 @@ int main(int argc, char** argv) {
             }
         );
 
+        CROW_ROUTE(app, "/api/clients/<string>/file/chunk").methods(crow::HTTPMethod::Get)(
+            [&server](const crow::request& request, const std::string& clientId) {
+                return guarded_json_response([&] {
+                    const auto decodedClientId = url_decode(clientId);
+                    const char* path = request.url_params.get("path");
+                    const char* offsetParam = request.url_params.get("offset");
+                    const char* lengthParam = request.url_params.get("length");
+                    long long offset = 0;
+                    int length = 4096;
+                    if (offsetParam != nullptr) {
+                        offset = std::max(0LL, std::atoll(offsetParam));
+                    }
+                    if (lengthParam != nullptr) {
+                        length = std::max(1, std::atoi(lengthParam));
+                    }
+                    return server.request_client(decodedClientId, {
+                        {"type", "read_file_chunk"},
+                        {"path", path ? std::string(path) : std::string()},
+                        {"offset", offset},
+                        {"length", length},
+                    });
+                });
+            }
+        );
+
         CROW_ROUTE(app, "/api/clients/<string>/file/write").methods(crow::HTTPMethod::Post)(
             [&server](const crow::request& request, const std::string& clientId) {
                 return guarded_json_response([&] {
@@ -1633,6 +1658,7 @@ int main(int argc, char** argv) {
                         {"type", "firmware_update"},
                         {"filename", body.value("filename", std::string("honeytea"))},
                         {"content_base64", body.value("content_base64", "")},
+                        {"staged_path", body.value("staged_path", "")},
                     });
                 });
             }
